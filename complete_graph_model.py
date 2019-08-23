@@ -78,9 +78,6 @@ class Model(nn.Module):
         self.graph_attention = VisualAttention(feat_dim + hid_dim, hid_dim, combined_feat_dim=hid_dim)
 
 
-
-
-
         # graph convolution layers
         self.graph_convolution_1 = \
             GraphConvolution(feat_dim, hid_dim * 2, n_kernels, 2)
@@ -113,6 +110,7 @@ class Model(nn.Module):
         # Compute question encoding
         emb = self.wembed(question)
         packed = pack_padded_sequence(emb, qlen, batch_first=True)  # questions have variable lengths
+        self.q_lstm.flatten_parameters()
         _, hid = self.q_lstm(packed)
         qenc = hid[0].unsqueeze(1)
         qenc_repeat = qenc.repeat(1, K, 1)
@@ -121,7 +119,6 @@ class Model(nn.Module):
         batch_size = image.size(0)
 
         #select top k objects with highest attention
-
 
         attention, img_ques_comb = self.img_attention(image, question_embed)
         attentions.append(attention)
@@ -140,13 +137,6 @@ class Model(nn.Module):
                                                                self.neighbourhood_size, self.neighbourhood_size, -1)
 
 
-        # bb = image[:, :, -4:].contiguous()
-        # bb_size = (bb[:, :, 2:]-bb[:, :, :2])
-        # bb_centre = bb[:, :, :2] + 0.5*bb_size
-        #
-        # neighbourhood_pseudo = self._compute_pseudo(bb_centre)
-        # neighbourhood_image = image.unsqueeze(dim=1).expand(batch_size, K, K, -1)
-
         hidden_graph_1 = self.graph_convolution_1(
             neighbourhood_image, neighbourhood_pseudo)
         hidden_graph_1 = F.relu(hidden_graph_1)
@@ -156,23 +146,11 @@ class Model(nn.Module):
         hidden_graph_1 = hidden_graph_1.unsqueeze(dim=1).expand(hidden_graph_1.size(0),
                                                                self.neighbourhood_size, self.neighbourhood_size, -1)
 
-        # hidden_graph_1 = hidden_graph_1.unsqueeze(dim=1).expand(hidden_graph_1.size(0),
-        #                                                        K, K, -1)
 
         hidden_graph_2 = self.graph_convolution_2(
             hidden_graph_1, neighbourhood_pseudo)
         hidden_graph_2 = F.relu(hidden_graph_2)
 
-
-
-
-
-        # attention_combined = torch.einsum("bi, bi->bi",
-        #                                   torch.gather(attention, 1, topk_idx),
-        #                                   graph_att)
-        #
-        #
-        # graph_feat = torch.einsum("bli, bl->bi", hidden_graph_2, attention_combined)
 
         # attention on graph  nodes
         graph_nodes_feat= torch.cat((topk_img, hidden_graph_2), dim=2)
@@ -180,8 +158,6 @@ class Model(nn.Module):
 
         attentions.append(
             torch.scatter(input=torch.zeros(batch_size, K), dim=1, index=topk_idx.cpu(), src=graph_att.cpu()))
-
-        graph_feat = torch.einsum("bli, bl->bi", graph_nodes_feat, graph_att)
 
 
         # Output classifier graph
@@ -196,13 +172,11 @@ class Model(nn.Module):
         hidden_2 = self.dropout(hidden_2)
         logits_2 = self.img_out_2(hidden_2)
 
-        logits = logits_1 + logits_2
-
 
         if self.return_attention:
-            return logits, attentions
+            return logits_1,logits_2, attentions
         else:
-            return logits
+            return logits_1, logits_2
 
 
 
@@ -236,11 +210,6 @@ class Model(nn.Module):
 
 
 
-
-
-
-
-
 class VisualAttention(nn.Module):
     def __init__(self, image_feat_dim, question_embeding_dim,
         combined_feat_dim):
@@ -257,7 +226,7 @@ class VisualAttention(nn.Module):
         self.dropout = nn.Dropout(p=0.3)
 
     def forward(self, img_features, question_feat):
-        """returns attention weights for image features"""
+        """returns attention weights for image features and attended image-question combined feature"""
         img_proj = F.relu(self.image_proj(img_features))
         q_proj = F.relu(self.txt_proj(question_feat))
 
@@ -272,7 +241,7 @@ class VisualAttention(nn.Module):
         img_attended = torch.einsum("bli, bl->bi", img_features, attention)
         combined_feat = F.relu(self.image_proj(img_attended))*q_proj
 
-        return attention.squeeze(-1), combined_feat
+        return attention, combined_feat
 
 
 

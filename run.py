@@ -1,3 +1,4 @@
+
 #    Copyright 2018 AimBrain Ltd.
 
 #    Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +25,7 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import RandomSampler
 from torch.optim.lr_scheduler import MultiStepLR
@@ -31,6 +33,10 @@ from torch.optim.lr_scheduler import MultiStepLR
 from complete_graph_model import Model
 from torch_dataset import *
 from utils import *
+from utils import *
+from tensorboardX import SummaryWriter
+
+TRAIN_REPORT_INTERVAL = 100
 
 def eval_model(args):
 
@@ -55,7 +61,7 @@ def eval_model(args):
     # Load the validation set
     print('Loading data')
     dataset = VQA_Dataset(args.data_dir, args.emb, train=False)
-    loader = DataLoader(dataset, batch_size=args.bsize,
+    loader = DataLoader(dataset, batch_size=512,
                         shuffle=False, num_workers=5, 
                         collate_fn=collate_fn)
 
@@ -77,12 +83,14 @@ def eval_model(args):
                   neighbourhood_size=args.neighbourhood_size)
 
     # move to CUDA
-    model = model.cuda()
+    model = nn.DataParallel(model).cuda()
+
 
     # Restore pre-trained model
     ckpt = torch.load(args.model_path)
     model.load_state_dict(ckpt['state_dict'])
-    model.train(False)
+    #model.train(False)
+    model = model.eval()
 
     # Compute accuracy
     result = []
@@ -94,13 +102,16 @@ def eval_model(args):
 
         # get predictions
         output = model(q_batch, i_batch, k_batch, qlen_batch)
+
+        output = F.softmax(output[0], dim=1) + F.softmax(output[1], dim=1)
+
         qid_batch = next_batch[3]
         _, oix = output.data.max(1)
         # record predictions
         for i, qid in enumerate(qid_batch):
             result.append({
                 'question_id': int(qid.numpy()),
-                'answer': dataset.a_itow[oix[i]]
+                'answer': dataset.a_itow[oix[i].item()]
             })
         # compute batch accuracy
         correct += total_vqa_score(output, vote_batch)
@@ -112,6 +123,13 @@ def eval_model(args):
     # save predictions
     json.dump(result, open('result.json', 'w'))
     print('Validation done')
+
+
+
+
+
+
+
 
 def train(args):
 
@@ -133,14 +151,13 @@ def train(args):
                         shuffle=True, num_workers=5, collate_fn=collate_fn)
 
     # Load the VQA validation set
-    dataset_test = VQA_Dataset(args.data_dir, args.emb, train=False)
-    test_sampler = RandomSampler(dataset_test)
-    loader_test = iter(DataLoader(dataset_test,
-                                  batch_size=args.bsize,
-                                  sampler=test_sampler,
-                                  shuffle=False,
-                                  num_workers=4,
-                                  collate_fn=collate_fn))
+    val_dataset = VQA_Dataset(args.data_dir, args.emb, train=False)
+
+    val_loader = DataLoader(val_dataset,
+                            batch_size=args.bsize,
+                            shuffle=False,
+                            num_workers=4,
+                            collate_fn=collate_fn)
 
     n_batches = len(dataset)//args.bsize
 
@@ -163,18 +180,19 @@ def train(args):
                   pretrained_wemb=dataset.pretrained_wemb)
 
 
-
-
     criterion = nn.MultiLabelSoftMarginLoss()
 
     # Move it to GPU
-    model = model.cuda()
+    #model = model.cuda()
+    model = nn.DataParallel(model).cuda()
 
 
     criterion = criterion.cuda()
 
     # Define the optimiser
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    logger = Logger(os.path.join('save/', 'log.txt'))
 
     # Continue training from saved model
     start_ep = 0
@@ -190,13 +208,12 @@ def train(args):
         param_group['lr'] = args.lr
 
     # Learning rate scheduler
-    scheduler = MultiStepLR(optimizer, milestones=[30], gamma=0.5)
+    scheduler = MultiStepLR(optimizer, milestones=[5,10,15], gamma=0.1)
     scheduler.last_epoch = start_ep - 1
 
     # Train iterations
     print('Start training.')
     for ep in range(start_ep, start_ep+args.ep):
-
         scheduler.step()
         ep_loss = 0.0
         ep_correct = 0.0
@@ -215,7 +232,10 @@ def train(args):
             output = model(
                 q_batch, i_batch, k_batch, qlen_batch)
 
-            loss = criterion(output, a_batch)
+            #loss = criterion(output[0], a_batch)
+
+            loss = criterion(output[0], a_batch) + criterion(output[1], a_batch)
+            output = output[0]+output[1]
 
             # Compute batch accuracy based on vqa evaluation
             correct = total_vqa_score(output, vote_batch)
@@ -226,10 +246,10 @@ def train(args):
             losses.append(loss.cpu().data.item())
 
             # This is a 40 step average
-            if step % 40 == 0 and step != 0:
-                print('  Epoch %02d(%03d/%03d), avg loss: %.7f, avg accuracy: %.2f%%' %
-                      (ep+1, step, n_batches, ave_loss/40,
-                       ave_correct * 100 / (args.bsize*40)))
+            if step % TRAIN_REPORT_INTERVAL == 0 and step != 0:
+                logger.write('  Epoch %02d(%03d/%03d), avg loss: %.7f, avg accuracy: %.2f%%' %
+                      (ep+1, step, n_batches, ave_loss/TRAIN_REPORT_INTERVAL,
+                       ave_correct * 100 / (args.bsize*TRAIN_REPORT_INTERVAL)))
 
                 ave_correct = 0
                 ave_loss = 0
@@ -239,38 +259,41 @@ def train(args):
             loss.backward()
             optimizer.step()
 
-            # save model and compute validation accuracy every 400 steps
-            if step % 1000 == 0:
-                epoch_loss = ep_loss / n_batches
-                epoch_acc = ep_correct * 100 / (n_batches * args.bsize)
-
-                save(model, optimizer, ep, epoch_loss, epoch_acc,
-                     dir=args.save_dir, name=args.name+'_'+str(ep+1))
-
-                # compute validation accuracy over a small subset of the validation set
-                test_correct = 0
-                model.train(False)
-
-                for i in range(10):
-                    test_batch = next(loader_test)
-                    q_batch, a_batch, vote_batch, i_batch, k_batch, qlen_batch = \
-                        batch_to_cuda(test_batch, volatile=True)
-                    output = model(q_batch, i_batch, k_batch, qlen_batch)
-                    test_correct += total_vqa_score(output, vote_batch)
-
-                model.train(True)
-                acc = test_correct/(10*args.bsize)*100
-                print("Validation accuracy: {:.2f} %".format(acc))
+        scheduler.step()
 
         # save model and compute accuracy for epoch
         epoch_loss = ep_loss / n_batches
         epoch_acc = ep_correct * 100 / (n_batches * args.bsize)
 
-        save(model, optimizer, ep, epoch_loss, epoch_acc,
-             dir=args.save_dir, name=args.name+'_'+str(ep+1))
-
         print('Epoch %02d done, average loss: %.3f, average accuracy: %.2f%%' % (
               ep+1, epoch_loss, epoch_acc))
+        logger.write('Epoch %02d done, average loss: %.3f, average accuracy: %.2f%%' % (
+              ep+1, epoch_loss, epoch_acc))
+
+
+        #Compute validation accuracy at the end of epoch
+        model.eval()
+        save(model, optimizer, ep, epoch_loss, epoch_acc,
+             dir=args.save_dir, name=args.name+'_'+str(ep+1))
+        with torch.no_grad():
+            test_correct = 0
+            for data in val_loader:
+
+                q_batch, a_batch, vote_batch, i_batch, k_batch, qlen_batch = \
+                    batch_to_cuda(data)
+
+                # forward pass
+                output = model(q_batch, i_batch, k_batch, qlen_batch)
+
+                output = output[0] + output[1]
+                test_correct += total_vqa_score(output, vote_batch)
+            acc = test_correct / len(val_dataset) * 100
+            logger.write("Validation accuracy: {:.2f} %".format(acc))
+
+
+
+
+
 
 def test(args):
 
@@ -336,7 +359,7 @@ def test(args):
         for i, qid in enumerate(qid_batch):
             result.append({
                 'question_id': int(qid.numpy()),
-                'answer': dataset.a_itow[oix[i]]
+                'answer': dataset.a_itow[oix[i].item()]
             })
  
     json.dump(result, open('result.json', 'w'))
@@ -475,11 +498,11 @@ if __name__ == '__main__':
     parser.add_argument('--test', action='store_true',
                         help='set this to test mode.')
     parser.add_argument('--lr', metavar='', type=float,
-                        default=1e-4, help='initial learning rate')
+                        default=0.01, help='initial learning rate')
     parser.add_argument('--ep', metavar='', type=int,
-                        default=40, help='number of epochs.')
+                        default=30, help='number of epochs.')
     parser.add_argument('--bsize', metavar='', type=int,
-                        default=64, help='batch size.')
+                        default=256, help='batch size.')
     parser.add_argument('--hid', metavar='', type=int,
                         default=1024, help='hidden dimension')
     parser.add_argument('--emb', metavar='', type=int, default=300,
